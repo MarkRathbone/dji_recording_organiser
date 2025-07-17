@@ -55,7 +55,7 @@ chmod +x organize_and_stitch.py
 Scan current directory with default settings:
 
 ```bash
-./organize_and_stitch.py
+./stitch.py
 ```
 
 Scan a custom folder, use a 45 s gap threshold, and enable verbose logging:
