@@ -8,7 +8,7 @@ Requires:
   • Python 3.6+
 
 Usage:
-  ./organize_and_stitch.py [--root DIR] [--gap N] [--pattern GLOB] [-v]
+  ./stitch.py [--root DIR] [--gap N] [--pattern GLOB] [-v]
 """
 import argparse
 import re
@@ -21,7 +21,8 @@ from pathlib import Path
 
 # Regex for original DJI filenames
 ORG_PATTERN = re.compile(
-    r'^DJI_(?P<date>\d{8})(?P<time>\d{6})_\d{4}_D\.(?P<ext>mp4|mkv)$', re.IGNORECASE
+    r'^DJI_(?P<date>\d{8})(?P<time>\d{6})_\d{4}_D\.(?P<ext>mp4|mkv)$',
+    re.IGNORECASE
 )
 
 
@@ -77,6 +78,23 @@ def probe_duration(path: Path) -> float:
     return float(result.stdout)
 
 
+def probe_stream_info(path: Path) -> dict:
+    """Return key stream info (codec_name, pix_fmt, color_transfer) via ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,pix_fmt,color_transfer",
+        "-of", "default=noprint_wrappers=1"
+    ]
+    result = subprocess.run(cmd + [str(path)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+    info = {}
+    for line in result.stdout.decode().splitlines():
+        if '=' in line:
+            key, val = line.split('=', 1)
+            info[key.strip()] = val.strip()
+    return info
+
+
 def group_sequences(clips, starts, durations, max_gap, verbose=False):
     """
     Given sorted clips, start times, durations, group into sequences
@@ -125,10 +143,10 @@ def run_concat_and_cleanup(seq_paths, output_dir: Path, start_time: str, verbose
     ]
     if not verbose:
         cmd += ["-loglevel", "error"]
-    print(f"Running concat → {temp_name}") if verbose else None
+    if verbose:
+        print(f"Running concat → {temp_name}")
     subprocess.run(cmd + [str(temp_path)], check=True)
 
-    # Cleanup sources
     for p in seq_paths:
         try:
             p.unlink()
@@ -138,7 +156,6 @@ def run_concat_and_cleanup(seq_paths, output_dir: Path, start_time: str, verbose
             if verbose:
                 print(f"Warning: source not found: {p.name}")
 
-    # Rename
     final_path = output_dir / final_name
     temp_path.replace(final_path)
     if verbose:
@@ -149,29 +166,32 @@ def stitch_day_directory(day_dir: Path, max_gap: float, verbose: bool) -> int:
     """
     Stitch all sequences in a YYYY/MM/DD folder. Returns count stitched.
     """
-    # Collect .mp4/.mkv sorted by actual start time
     clips = []
     starts, durations = [], []
     for ext in ("mp4", "mkv"):
         for f in sorted(day_dir.glob(f"*.{ext}")):
-            # Filename HHMMSS(.counter).ext
-            time_str = f.stem.split('_')[0]
+            parts = f.stem.split('_')
+            time_part = next((p for p in parts if re.fullmatch(r"\d{6}", p)), None)
+            if not time_part:
+                if verbose:
+                    print(f"Skipping {f.name}: no valid HHMMSS timestamp found")
+                continue
+            hh, mm, ss = time_part[:2], time_part[2:4], time_part[4:6]
             try:
                 start_dt = datetime(
                     int(day_dir.parent.parent.name),
                     int(day_dir.parent.name),
                     int(day_dir.name),
-                    int(time_str[0:2]),
-                    int(time_str[2:4]),
-                    int(time_str[4:6])
+                    int(hh), int(mm), int(ss)
                 )
-            except Exception:
+            except ValueError:
+                if verbose:
+                    print(f"Skipping {f.name}: invalid time {time_part}")
                 continue
             clips.append(f)
             starts.append(start_dt)
             durations.append(probe_duration(f))
 
-    # Ensure sorted by start time
     order = sorted(range(len(clips)), key=lambda i: starts[i])
     clips = [clips[i] for i in order]
     starts = [starts[i] for i in order]
@@ -183,8 +203,25 @@ def stitch_day_directory(day_dir: Path, max_gap: float, verbose: bool) -> int:
         if len(seq) < 2:
             continue
         seq_paths = [clips[i] for i in seq]
-        start_time = starts[seq[0]].strftime("%H%M%S")
-        print(f"Stitching {len(seq)} clips starting at {start_time}")
+        # Check codec and pixel format consistency
+        infos = [probe_stream_info(p) for p in seq_paths]
+        first = infos[0]
+        mismatches = [i for i,info in enumerate(infos[1:],1)
+                      if info.get('codec_name') != first.get('codec_name')
+                      or info.get('pix_fmt') != first.get('pix_fmt')
+                      or info.get('color_transfer') != first.get('color_transfer')]
+        if mismatches:
+            print(f"⚠️ Skipping stitching starting {starts[seq[0]].strftime('%Y%m%d_%H%M%S')}: codec/pix_fmt/color_transfer mismatch:")
+            for idx in [0] + mismatches:
+                p = seq_paths[idx]
+                info = infos[idx]
+                print(f"  {p.name} → codec={info.get('codec_name')}, pix_fmt={info.get('pix_fmt')}, transfer={info.get('color_transfer')}")
+            continue
+        start_time = starts[seq[0]].strftime("%Y%m%d_%H%M%S")
+        print(f"Stitching {len(seq_paths)} clips starting at {start_time}")
+        print("Files to stitch:")
+        for clip in seq_paths:
+            print(f"  {clip.name}")
         run_concat_and_cleanup(seq_paths, day_dir, start_time, verbose)
         stitched += 1
     return stitched
